@@ -8,3 +8,5 @@ require (
 	github.com/rs/zerolog v1.25.0
 	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 )
+
+require github.com/shopspring/decimal v1.2.0 // indirect

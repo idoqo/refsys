@@ -1,6 +1,9 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+	"github.com/shopspring/decimal"
+)
 
 type PayoutType string
 type PayoutStatus string
@@ -32,8 +35,9 @@ type User struct {
 type Payout struct {
 	ID int64 `json:"id,omitempty"`
 	UserID int64 `json:"user_id"`
+	Username string `json:"username,omitempty"`
 	CheckpointID int64 `json:"checkpoint_id"`
-	Amount int64 `json:"amount"`
+	Amount decimal.Decimal `json:"amount"`
 	Status PayoutStatus `json:"status"`
 	Type PayoutType `json:"type"`
 }

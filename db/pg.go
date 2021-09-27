@@ -5,6 +5,7 @@ import (
 	"fmt"
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog"
+	"github.com/shopspring/decimal"
 	"math/rand"
 	"time"
 )
@@ -56,8 +57,8 @@ func (p PgDb) SaveUser(username, hashedPassword, referrer string) (id int64, ref
 
 func (p PgDb) UserByRefCode(refCode string) (User, error) {
 	var u User
-	query := "SELECT id, username, referrer, referral_code FROM users WHERE referral_code=$1 LIMIT 1"
-	err := p.Conn.QueryRow(query, refCode).Scan(&u.ID, &u.Username, &u.Referrer, &u.ReferralCode)
+	query := "SELECT id, username, referral_code FROM users WHERE referral_code=$1 LIMIT 1"
+	err := p.Conn.QueryRow(query, refCode).Scan(&u.ID, &u.Username, &u.ReferralCode)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return u, ErrNoRow
@@ -75,47 +76,50 @@ func (p PgDb) CheckAndTriggerPayout(referrer User, payoutType PayoutType) (Payou
 	var lastCheckpoint int
 	var payout Payout
 
-	checkpointQ := "SELECT checkpoint_id FROM payouts WHERE referrer_id=$1 AND activity_type=$2 ORDER BY id DESC LIMIT 1"
+	checkpointQ := "SELECT checkpoint_id FROM payouts WHERE user_id=$1 AND activity_type=$2 ORDER BY id DESC LIMIT 1"
 	err := p.Conn.QueryRow(checkpointQ, referrer.ID, payoutType).Scan(&lastCheckpoint)
-	if err != nil {
+	if err != nil && err != sql.ErrNoRows {
 		return payout, false, err
 	}
 
 	friends := make([]User, MinReferrals)
 	// checkpoint remains 0 if no payout has happened for the user, so it's safe to use in querying friends.
-	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer_code = $2 ORDER BY id ASC LIMIT $3"
+	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
 	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
 	if err != nil {
 		return payout, false, err
 	}
 
+	i := 0
 	for rows.Next() {
 		var u User
 		err := rows.Scan(&u.ID, &u.Username, &u.Referrer)
 		if err != nil {
 			return payout, false, err
 		}
-		friends = append(friends, u)
+		friends[i] = u
+		i++
 	}
+	p.Logger.Info().Msgf("processing payouts because %+v", friends)
 
-	if len(friends) < MinReferrals {
+	// pick the last user in the list to use as checkpoint
+	newCheckpoint := friends[MinReferrals-1]
+	if newCheckpoint.ID == 0 {
 		return payout, false, nil
 	}
 
-	if len(friends) == MinReferrals {
-		// pick the last user in the list to use as checkpoint
-		newCheckpoint := friends[MinReferrals-1]
-		newPayoutQ := "INSERT INTO payouts(user_id, activity_type, checkpoint_id, amount, status) VALUES($1, $2, $3, $4, $5)"
-		err := p.Conn.QueryRow(newPayoutQ, referrer.ID, Signups, newCheckpoint.ID, ReferralBonus, Pending).Scan(
-			&payout.ID, &payout.Type, &payout.CheckpointID, &payout.Amount, &payout.Status,
-			)
-		if err != nil {
-			return payout, false, err
-		} else {
-			return payout, true, nil
-		}
+	var amount string
+	newPayoutQ := "INSERT INTO payouts(user_id, activity_type, checkpoint_id, amount, status) VALUES($1, $2, $3, $4, $5) RETURNING id, user_id, activity_type, checkpoint_id, amount, status"
+	err = p.Conn.QueryRow(newPayoutQ, referrer.ID, Signups, newCheckpoint.ID, ReferralBonus, Pending).Scan(
+		&payout.ID, &payout.UserID, &payout.Type, &payout.CheckpointID, &amount, &payout.Status,
+	)
+	if err != nil {
+		return payout, false, err
+	} else {
+		payout.Amount, _ = decimal.NewFromString(amount)
+		payout.Username = referrer.Username
+		return payout, true, nil
 	}
-	return payout, false, nil
 }
 
 func generateRefCode(length int) string {
