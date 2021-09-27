@@ -13,6 +13,7 @@ type TransactionType string
 
 const (
 	MinReferrals = 3
+	MinAmountForReferral = 200
 	ReferralBonus = 50
 )
 

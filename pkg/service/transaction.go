@@ -19,7 +19,7 @@ func (s Service) CreateTransaction(senderId, recipientId int, amount decimal.Dec
 		return t, err
 	}
 
-	minAmountForReferral := decimal.NewFromInt(200)
+	minAmountForReferral := decimal.NewFromInt(db.MinAmountForReferral)
 	if t.Amount.Cmp(minAmountForReferral) >= 0 {
 		go s.TransactionCreatedEvent(t)
 	}

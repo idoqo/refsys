@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"math/rand"
+	"strings"
 	"time"
 )
 
@@ -165,36 +166,59 @@ func (p PgDb) CheckAndTriggerPayout(referrer User, payoutType PayoutType) (Payou
 		return payout, false, err
 	}
 
-	friends := make([]User, MinReferrals)
 	if payoutType == Signups {
+		friends := make([]User, MinReferrals)
 		err = p.copyFriendsForSignups(friends, referrer, lastCheckpoint)
+		if err != nil {
+			return payout, false, err
+		}
+
+		p.Logger.Info().Msgf("processing signup payouts because %+v", friends)
+
+		// pick the last user in the list to use as checkpoint
+		newCheckpoint := friends[MinReferrals-1]
+		if newCheckpoint.ID == 0 {
+			return payout, false, nil
+		}
+
+		var amount string
+		newPayoutQ := "INSERT INTO payouts(user_id, activity_type, checkpoint_id, amount, status) VALUES($1, $2, $3, $4, $5) RETURNING id, user_id, activity_type, checkpoint_id, amount, status"
+		err = p.Conn.QueryRow(newPayoutQ, referrer.ID, Signups, newCheckpoint.ID, ReferralBonus, Pending).Scan(
+			&payout.ID, &payout.UserID, &payout.Type, &payout.CheckpointID, &amount, &payout.Status,
+		)
+		if err != nil {
+			return payout, false, err
+		} else {
+			payout.Amount, _ = decimal.NewFromString(amount)
+			payout.Username = referrer.Username
+		}
 	} else if payoutType == Transactions {
-		err = p.copyFriendsForTransactions(friends, referrer, lastCheckpoint)
-	}
-	if err != nil {
-		return payout, false, err
-	}
+		txns := make([]Transaction, MinReferrals)
+		err = p.copyFriendsForTransactions(txns, referrer, lastCheckpoint)
+		if err != nil {
+			return payout, false, err
+		}
 
-	p.Logger.Info().Msgf("processing payouts because %+v", friends)
+		p.Logger.Info().Msgf("processing txn payouts because %+v", txns)
+		// pick the last user in the list to use as checkpoint
+		newCheckpoint := txns[MinReferrals-1]
+		if newCheckpoint.ID == 0 {
+			return payout, false, nil
+		}
 
-	// pick the last user in the list to use as checkpoint
-	newCheckpoint := friends[MinReferrals-1]
-	if newCheckpoint.ID == 0 {
-		return payout, false, nil
+		var amount string
+		newPayoutQ := "INSERT INTO payouts(user_id, activity_type, checkpoint_id, amount, status) VALUES($1, $2, $3, $4, $5) RETURNING id, user_id, activity_type, checkpoint_id, amount, status"
+		err = p.Conn.QueryRow(newPayoutQ, referrer.ID, Transactions, newCheckpoint.ID, ReferralBonus, Pending).Scan(
+			&payout.ID, &payout.UserID, &payout.Type, &payout.CheckpointID, &amount, &payout.Status,
+		)
+		if err != nil {
+			return payout, false, err
+		} else {
+			payout.Amount, _ = decimal.NewFromString(amount)
+			payout.Username = referrer.Username
+		}
 	}
-
-	var amount string
-	newPayoutQ := "INSERT INTO payouts(user_id, activity_type, checkpoint_id, amount, status) VALUES($1, $2, $3, $4, $5) RETURNING id, user_id, activity_type, checkpoint_id, amount, status"
-	err = p.Conn.QueryRow(newPayoutQ, referrer.ID, Signups, newCheckpoint.ID, ReferralBonus, Pending).Scan(
-		&payout.ID, &payout.UserID, &payout.Type, &payout.CheckpointID, &amount, &payout.Status,
-	)
-	if err != nil {
-		return payout, false, err
-	} else {
-		payout.Amount, _ = decimal.NewFromString(amount)
-		payout.Username = referrer.Username
-		return payout, true, nil
-	}
+	return payout, true, nil
 }
 
 func (p PgDb) copyFriendsForSignups(friends []User, referrer User, lastCheckpoint int) error {
@@ -218,9 +242,50 @@ func (p PgDb) copyFriendsForSignups(friends []User, referrer User, lastCheckpoin
 	return nil
 }
 
-func (p PgDb) copyFriendsForTransactions(friends []User, referrer User, lastCheckpoint int) error {
+func (p PgDb) copyFriendsForTransactions(txns []Transaction, referrer User, lastCheckpoint int) error {
 	// select all friends (user_id where referrer = referrer.ReferralCode)
 	// select from transactions where sender_id in [friends_id] and amount > 200 and id > lastcheckpoint
+
+	if referrer.ReferralCode == "" {
+		return nil
+	}
+
+	friendsIDQ := "SELECT id FROM users WHERE referrer = $1"
+	rows, err := p.Conn.Query(friendsIDQ, referrer.ReferralCode)
+	if err != nil {
+		return err
+	}
+
+	// build the friend's id list for the IN clause
+	var friendsID []int
+	for rows.Next() {
+		var id int
+		err := rows.Scan(&id)
+		if err != nil {
+			return err
+		}
+		friendsID = append(friendsID, id)
+	}
+	idClause := strings.Join(strings.Fields(fmt.Sprint(friendsID)), ", ")
+	idClause = strings.Replace(idClause, "[", "(", 1)
+	idClause = strings.Replace(idClause, "]", ")", 1)
+	p.Logger.Info().Msgf("IDs for IN clause: %s", idClause)
+
+	validTxnQ := "SELECT id, reference, amount FROM transactions WHERE sender_id IN " + idClause +" AND amount > $1 AND id > $2 LIMIT $3"
+	rows, err = p.Conn.Query(validTxnQ, MinAmountForReferral, lastCheckpoint, MinReferrals)
+	if err != nil {
+		return err
+	}
+	i := 0
+	for rows.Next() {
+		var t Transaction
+		if err = rows.Scan(&t.ID, &t.Reference, &t.Amount); err != nil {
+			return err
+		}
+		txns[i] = t
+		i++
+	}
+	return nil
 
 	/*friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
 	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
