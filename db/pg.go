@@ -83,23 +83,15 @@ func (p PgDb) CheckAndTriggerPayout(referrer User, payoutType PayoutType) (Payou
 	}
 
 	friends := make([]User, MinReferrals)
-	// checkpoint remains 0 if no payout has happened for the user, so it's safe to use in querying friends.
-	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
-	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
+	if payoutType == Signups {
+		err = p.copyFriendsForSignups(friends, referrer, lastCheckpoint)
+	} else if payoutType == Transactions {
+		err = p.copyFriendsForTransactions(friends, referrer, lastCheckpoint)
+	}
 	if err != nil {
 		return payout, false, err
 	}
 
-	i := 0
-	for rows.Next() {
-		var u User
-		err := rows.Scan(&u.ID, &u.Username, &u.Referrer)
-		if err != nil {
-			return payout, false, err
-		}
-		friends[i] = u
-		i++
-	}
 	p.Logger.Info().Msgf("processing payouts because %+v", friends)
 
 	// pick the last user in the list to use as checkpoint
@@ -120,6 +112,50 @@ func (p PgDb) CheckAndTriggerPayout(referrer User, payoutType PayoutType) (Payou
 		payout.Username = referrer.Username
 		return payout, true, nil
 	}
+}
+
+func (p PgDb) copyFriendsForSignups(friends []User, referrer User, lastCheckpoint int) error {
+	// checkpoint remains 0 if no payout has happened for the user, so it's safe to use in querying friends.
+	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
+	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	for rows.Next() {
+		var u User
+		err := rows.Scan(&u.ID, &u.Username, &u.Referrer)
+		if err != nil {
+			return err
+		}
+		friends[i] = u
+		i++
+	}
+	return nil
+}
+
+func (p PgDb) copyFriendsForTransactions(friends []User, referrer User, lastCheckpoint int) error {
+	// select all friends (user_id where referrer = referrer.ReferralCode)
+	// select from transactions where sender_id in [friends_id] and amount > 200 and id > lastcheckpoint
+
+	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
+	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	for rows.Next() {
+		var u User
+		err := rows.Scan(&u.ID, &u.Username, &u.Referrer)
+		if err != nil {
+			return err
+		}
+		friends[i] = u
+		i++
+	}
+	return nil
 }
 
 func generateRefCode(length int) string {
