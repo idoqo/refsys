@@ -23,6 +23,7 @@ type PgDb struct {
 	Logger zerolog.Logger
 }
 
+
 func InitPostgres(cfg Config, logger zerolog.Logger) (PgDb, error){
 	db := PgDb{}
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
@@ -39,6 +40,75 @@ func InitPostgres(cfg Config, logger zerolog.Logger) (PgDb, error){
 		return db, err
 	}
 	return db, nil
+}
+
+
+func (p PgDb) SaveTransaction(transaction *Transaction) error {
+	var err error
+	var senderBal string
+	var recipientBal string
+	var senderBalance decimal.Decimal
+	var recipientBalance decimal.Decimal
+
+	senderBalQ := `SELECT closing_balance FROM wallets WHERE user_id=$1 ORDER BY id DESC LIMIT 1`
+	err = p.Conn.QueryRow(senderBalQ, transaction.SenderID).Scan(&senderBal)
+	if err != nil && err != sql.ErrNoRows {
+		p.Logger.Err(err).Msg("rollback db txn")
+		return fmt.Errorf("sender balance %s", err)
+	}
+
+	recipientBalQ := `SELECT closing_balance FROM wallets WHERE user_id=$1 ORDER BY id DESC LIMIT 1`
+	err = p.Conn.QueryRow(recipientBalQ, transaction.RecipientID).Scan(&recipientBal)
+	if err != nil && err != sql.ErrNoRows {
+		p.Logger.Err(err).Msg("rollback db txn")
+		return fmt.Errorf("recipient balance %s", err)
+	}
+
+	senderBalance, _ = decimal.NewFromString(senderBal)
+	recipientBalance, _ = decimal.NewFromString(recipientBal)
+	// ensure the sender have enough in their account
+	if senderBalance.Cmp(transaction.Amount) < 0 {
+		return ErrInsufficientFunds
+	}
+
+	reference := generateRefCode(16)
+	dbtx, err := p.Conn.Begin()
+	if err != nil {
+		return err
+	}
+
+	txQ := `INSERT INTO transactions(reference, amount, sender_id, recipient_id, description)
+			VALUES ($1, $2, $3, $4, $5) RETURNING id, reference`
+	err = dbtx.QueryRow(txQ, reference, transaction.Amount, transaction.SenderID, transaction.RecipientID, transaction.Description).Scan(
+		&transaction.ID,
+		&transaction.Reference,
+		)
+	if err != nil {
+		p.Logger.Err(dbtx.Rollback()).Msg("rollback db txn")
+		return err
+	}
+
+	debitQ := `INSERT INTO wallets(user_id, transaction_type, transaction_reference, amount, closing_balance) 
+				VALUES ($1, $2, $3, $4, $5)`
+	_, err = dbtx.Exec(debitQ, transaction.SenderID, Debit, reference, transaction.Amount, senderBalance.Sub(transaction.Amount))
+	if err != nil {
+		p.Logger.Err(dbtx.Rollback()).Msg("rollback db txn")
+		return err
+	}
+
+	creditQ := `INSERT INTO wallets(user_id, transaction_type, transaction_reference, amount, closing_balance) 
+				VALUES ($1, $2, $3, $4, $5)`
+	_, err = dbtx.Exec(creditQ, transaction.RecipientID, Credit, reference, transaction.Amount, recipientBalance.Add(transaction.Amount))
+	if err != nil {
+		p.Logger.Err(dbtx.Rollback()).Msg("rollback db txn")
+		return err
+	}
+
+	if err = dbtx.Commit(); err != nil {
+		p.Logger.Err(dbtx.Rollback()).Msg("rollback db txn")
+		return err
+	}
+	return nil
 }
 
 func (p PgDb) SaveUser(username, hashedPassword, referrer string) (id int64, referralCode string, err error) {
@@ -59,6 +129,19 @@ func (p PgDb) UserByRefCode(refCode string) (User, error) {
 	var u User
 	query := "SELECT id, username, referral_code FROM users WHERE referral_code=$1 LIMIT 1"
 	err := p.Conn.QueryRow(query, refCode).Scan(&u.ID, &u.Username, &u.ReferralCode)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return u, ErrNoRow
+		}
+		return u, err
+	}
+	return u, nil
+}
+
+func (p PgDb) UsersReferrer(userId int64) (User, error) {
+	var u User
+	query := "SELECT u.id, u.username, u.referral_code FROM users u JOIN users on u.referral_code=users.referrer WHERE users.id=$1 LIMIT 1"
+	err := p.Conn.QueryRow(query, userId).Scan(&u.ID, &u.Username, &u.ReferralCode)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return u, ErrNoRow
@@ -139,7 +222,7 @@ func (p PgDb) copyFriendsForTransactions(friends []User, referrer User, lastChec
 	// select all friends (user_id where referrer = referrer.ReferralCode)
 	// select from transactions where sender_id in [friends_id] and amount > 200 and id > lastcheckpoint
 
-	friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
+	/*friendsQ := "SELECT id, username, referrer FROM users WHERE id > $1 AND referrer = $2 ORDER BY id LIMIT $3"
 	rows, err := p.Conn.Query(friendsQ, lastCheckpoint, referrer.ReferralCode, MinReferrals)
 	if err != nil {
 		return err
@@ -154,7 +237,7 @@ func (p PgDb) copyFriendsForTransactions(friends []User, referrer User, lastChec
 		}
 		friends[i] = u
 		i++
-	}
+	}*/
 	return nil
 }
 

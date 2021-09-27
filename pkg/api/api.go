@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"github.com/dimfeld/httptreemux/v5"
 	"github.com/rs/zerolog"
+	"github.com/shopspring/decimal"
 	"gitlab.com/idoko/refsys/db"
 	"gitlab.com/idoko/refsys/pkg/service"
 	"net/http"
+	"strconv"
 )
 
 type Api struct {
@@ -49,14 +51,13 @@ func (api Api) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-type userReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Referrer string `json:"referrer"`
-}
-
 func (api Api) Signup(w http.ResponseWriter, r *http.Request) {
-	var ur userReq
+	ur := struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Referrer string `json:"referrer"`
+	}{}
+
 	jd := json.NewDecoder(r.Body)
 	if err := jd.Decode(&ur); err != nil {
 		api.Logger.Err(err).Msg("parsing user request")
@@ -86,5 +87,64 @@ func (api Api) Signup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api Api) Transaction(w http.ResponseWriter, r *http.Request) {
+	tr := struct{
+		SenderID string `json:"sender_id"` // ideally this would be extracted from an auth token
+		RecipientID string `json:"recipient_id"`
+		Amount string `json:"amount"`
+		Description string `json:"description,omitempty"`
+	}{}
 
+	jd := json.NewDecoder(r.Body)
+	if err := jd.Decode(&tr); err != nil {
+		api.Logger.Err(err).Msg("parsing user request")
+		_ = api.res(http.StatusBadRequest, w, map[string]string{
+			"error": "failed to parse request",
+		})
+		return
+	}
+
+	amount, err := decimal.NewFromString(tr.Amount)
+	if err != nil {
+		api.Logger.Err(err).Msg("parsing amount from request")
+		_ = api.res(http.StatusBadRequest, w, map[string]string{
+			"error": "amount is invalid",
+		})
+		return
+	}
+	if tr.RecipientID == "" || tr.SenderID == "" {
+		_ = api.res(http.StatusBadRequest, w, map[string]string{
+			"error": "sender and/or recipient id cannot be blank",
+		})
+		return
+	}
+
+	senderId, err := strconv.Atoi(tr.SenderID)
+	if err != nil {
+		_ = api.res(http.StatusBadRequest, w, map[string]string {
+			"error": "sender id is invalid",
+		})
+	}
+	recipientId, err := strconv.Atoi(tr.RecipientID)
+	if err != nil {
+		_ = api.res(http.StatusBadRequest, w, map[string]string {
+			"error": "recipient id is invalid",
+		})
+	}
+
+	t, err := api.Service.CreateTransaction(senderId, recipientId, amount, tr.Description)
+	if err != nil {
+		if err == db.ErrInsufficientFunds {
+			_ = api.res(http.StatusUnauthorized, w, map[string]string{
+				"error": "insufficient funds",
+			})
+			return
+		}
+		api.Logger.Err(err).Msg("creating transaction")
+		_ = api.res(http.StatusInternalServerError, w, map[string]string{
+			"error": "failed to complete transaction",
+		})
+
+		return
+	}
+	_ = api.res(http.StatusCreated, w, t)
 }
